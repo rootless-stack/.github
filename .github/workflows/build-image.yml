@@ -1,0 +1,218 @@
+# Reusable: build one image per architecture on native runners and publish
+# an unsigned CANDIDATE manifest list:
+#
+#   ghcr.io/<owner>/<repo>/<image>:sha-<commit>-p<run>-<arch>   per arch
+#   ghcr.io/<owner>/<repo>/<image>:sha-<commit>-p<run>          the list
+#
+# The run ID makes every candidate unique, so concurrent runs never
+# overwrite each other's.  The calling stack validates the candidate,
+# then promote-image.yml copies the recorded digest to the published name,
+# signs it, or leaves the published tag alone when nothing changed.
+#
+# Trust: only runs on the default branch (push, schedule, dispatch) write
+# the layer cache; pull requests read it and never write it, so
+# PR-authored build content can never end up in a layer a trusted build
+# reuses.  Pull requests from the same repository push candidates for
+# their validators; pull requests from forks get a read-only token and
+# build without pushing.
+#
+# Every build stamps the image with the hash of what it runs
+# (rootless-stack.content: config plus file tree, no timestamps), in a
+# label-only rebuild after hashing.  A cold nightly rebuild has a new
+# digest even when Alpine served the same packages; promote compares this
+# label instead, so an unchanged image restarts nothing.
+#
+# Caller:
+#   jobs:
+#     build:
+#       uses: rootless-stack/.github/.github/workflows/build-image.yml@main
+#       with: {image: postfix, context: dockerfiles, file: dockerfiles/postfix/Dockerfile}
+#       secrets:
+#         DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+#         DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+#       permissions: {contents: read, packages: write}
+name: build-image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image name; the candidate is ghcr.io/<owner>/<repo>/<image>
+        type: string
+        required: true
+      context:
+        type: string
+        default: .
+      file:
+        description: Dockerfile path; default <context>/Dockerfile
+        type: string
+        default: ""
+      no-cache:
+        description: Build every layer fresh (nightly, so package updates land)
+        type: boolean
+        default: false
+    secrets:
+      # Optional: authenticated Docker Hub pulls for FROM docker.io/...;
+      # without them buildah pulls anonymously, subject to Docker Hub's
+      # rate limit, which shared runner addresses reach easily.
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
+    outputs:
+      candidate:
+        description: The candidate manifest list, by tag
+        value: ${{ jobs.manifest.outputs.candidate }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ${{ inputs.image }}
+  CANDIDATE: ghcr.io/${{ github.repository }}/${{ inputs.image }}
+  CACHE: ghcr.io/${{ github.repository }}/${{ inputs.image }}-cache
+  SHA_TAG: sha-${{ github.sha }}-p${{ github.run_id }}
+  ARCHES: amd64 arm64
+  # Trusted: the default branch.  Only trusted runs write the layer cache.
+  TRUSTED: ${{ github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+  # A fork's pull request has a read-only token: build, don't push.
+  PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-26.04}
+          - {arch: arm64, runner: ubuntu-26.04-arm}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ARCH: ${{ matrix.arch }}
+      BUILDAH_FORMAT: docker
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$PUSH" = true ]; then
+            printf '%s' "$TOKEN" | buildah login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          fi
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            printf '%s' "$DOCKERHUB_TOKEN" | buildah login --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
+          else
+            echo "::warning::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN unset — pulling docker.io anonymously (rate-limited)"
+          fi
+      - name: Build
+        env:
+          CONTEXT: ${{ inputs.context }}
+          FILE: ${{ inputs.file || format('{0}/Dockerfile', inputs.context) }}
+          NO_CACHE: ${{ inputs.no-cache }}
+        run: |
+          set -euo pipefail
+          cache=()
+          if [ "$NO_CACHE" = true ]; then cache+=(--no-cache); else cache+=(--cache-from "$CACHE"); fi
+          if [ "$TRUSTED" = true ]; then cache+=(--cache-to "$CACHE"); fi
+          buildah build --layers "${cache[@]}" -f "$FILE" -t "local/$IMAGE:$ARCH" "$CONTEXT"
+      - name: Stamp the content hash
+        # sha256 over what the image runs: its config and its file tree
+        # (paths, modes, owners, link targets, file capabilities, contents),
+        # but not mtimes.  It errs towards "changed": a file that differs on
+        # every build only restores a nightly restart.  Excluded, as they
+        # differ between otherwise identical builds: /var/log/apk.log
+        # (timestamps) and /etc/shadow, whose last-change field is the build
+        # day (adduser); a user change touches /etc/passwd too.  The
+        # LABEL-only rebuild adds no layer and keeps the hash, and the
+        # per-commit source labels, out of what it hashes.
+        run: |
+          set -euo pipefail
+          img="local/$IMAGE:$ARCH"
+          # shellcheck disable=SC2016  # expanded by the inner shell
+          content=$(buildah unshare bash -euo pipefail -c '
+            c=$(buildah from --pull=never --quiet "$1")
+            trap "buildah rm \"\$c\" >/dev/null" EXIT
+            m=$(buildah mount "$c")
+            {
+              buildah inspect --type image --format "{{json .OCIv1.Config}}" "$1"
+              tar -C "$m" -cf - --sort=name --mtime=@0 --numeric-owner --format=posix \
+                --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
+                --xattrs --xattrs-include=security.capability \
+                --exclude=./var/log/apk.log --exclude=./etc/shadow --exclude=./etc/shadow- .
+            } | sha256sum | cut -d" " -f1
+          ' _ "$img")
+          echo "content $content"
+          ctx=$(mktemp -d)
+          printf 'FROM %s\nLABEL rootless-stack.content=%s\nLABEL org.opencontainers.image.source=%s\nLABEL org.opencontainers.image.revision=%s\n' \
+            "$img" "$content" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA" > "$ctx/Containerfile"
+          buildah build --pull=never --quiet -t "$img" "$ctx" >/dev/null
+          rm -rf "$ctx"
+      - name: Push the candidate
+        if: env.PUSH == 'true'
+        run: |
+          set -euo pipefail
+          ref="$CANDIDATE:$SHA_TAG-$ARCH"
+          buildah push "local/$IMAGE:$ARCH" "docker://$ref"
+          mkdir -p candidate-digests
+          skopeo inspect --raw "docker://$ref" | sha256sum | cut -d' ' -f1 > "candidate-digests/$ARCH.digest"
+          echo "pushed $ref (sha256:$(cat "candidate-digests/$ARCH.digest"))"
+      - if: env.PUSH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ inputs.image }}-${{ matrix.arch }}
+          path: candidate-digests/
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    needs: build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      candidate: ${{ steps.push.outputs.candidate }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-${{ inputs.image }}-*
+          path: candidate-digests
+          merge-multiple: true
+      - id: push
+        name: Push the manifest list
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$TOKEN" | buildah login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          list="$CANDIDATE:$SHA_TAG"
+          buildah manifest create "$list"
+          for arch in $ARCHES; do
+            digest=$(cat "candidate-digests/$arch.digest")
+            case "$digest" in *[!0-9a-f]*|'') echo "::error::invalid $arch digest artifact"; exit 1 ;; esac
+            [ "${#digest}" -eq 64 ] || { echo "::error::invalid $arch digest length"; exit 1; }
+            # The tag must still point where the build left it.
+            current=$(skopeo inspect --raw "docker://$list-$arch" | sha256sum | cut -d' ' -f1)
+            [ "$current" = "$digest" ] || { echo "::error::$arch candidate tag changed after the build job"; exit 1; }
+            echo "adding $list-$arch at sha256:$digest"
+            buildah manifest add "$list" "docker://$CANDIDATE@sha256:$digest"
+          done
+          buildah manifest push --all "$list" "docker://$list"
+          mkdir -p candidate
+          skopeo inspect --raw "docker://$list" | sha256sum | cut -d' ' -f1 > candidate/candidate.digest
+          echo "candidate=$list" >> "$GITHUB_OUTPUT"
+          echo "candidate: $list (sha256:$(cat candidate/candidate.digest))" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: candidate-${{ inputs.image }}
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 1

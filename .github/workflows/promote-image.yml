@@ -146,15 +146,32 @@ jobs:
           else
             { echo "action=promote"; echo "candidate=$candidate_ref"; echo "published=sha256:$digest"; } >> "$GITHUB_OUTPUT"
           fi
+      - if: steps.decide.outputs.action == 'promote'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+      # Before anything is staged or signed: decrypting the key proves the
+      # secret is the key file's content and the password matches it.
+      - name: Check the org key
+        if: steps.decide.outputs.action == 'promote'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          # GitHub Free passes no organization secret to a private repository.
+          [ -n "$COSIGN_PRIVATE_KEY" ] || {
+            echo "::error::COSIGN_PRIVATE_KEY is empty: on GitHub Free, organization secrets reach public repositories only; make $GITHUB_REPOSITORY public or set the secrets on it"
+            exit 1
+          }
+          cosign public-key --key env://COSIGN_PRIVATE_KEY >/dev/null || {
+            echo "::error::COSIGN_PRIVATE_KEY/COSIGN_PASSWORD do not decrypt; set the key file's content: gh secret set COSIGN_PRIVATE_KEY --org $GITHUB_REPOSITORY_OWNER < <prefix>.private"
+            exit 1
+          }
       - name: Stage the candidate in the published repository
         if: steps.decide.outputs.action == 'promote'
         env:
           CANDIDATE_REF: ${{ steps.decide.outputs.candidate }}
         run: skopeo copy --all --preserve-digests "docker://$CANDIDATE_REF" "docker://$PUBLISHED:$SHA_TAG"
-      - if: steps.decide.outputs.action == 'promote'
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v3.1.3
       - name: Sign keyless
         if: steps.decide.outputs.action == 'promote'
         env:
@@ -196,3 +213,11 @@ jobs:
           skopeo copy --all --preserve-digests "docker://$PUBLISHED:$SHA_TAG" "docker://$PUBLISHED:$TAG"
           signed "$PUBLISHED:$TAG" || { echo "::error::$PUBLISHED:$TAG is not fully signed"; exit 1; }
           echo "published $PUBLISHED:$TAG ($(skopeo inspect --format '{{.Digest}}' "docker://$PUBLISHED:$TAG"))" | tee -a "$GITHUB_STEP_SUMMARY"
+      # Hosts pull anonymously.  GitHub creates every package private and
+      # offers no API to change that: the web UI does, once per package and
+      # for good.  Candidates (ghcr.io/<owner>/<repo>/<image>) stay private.
+      - name: Check that hosts can pull it
+        if: steps.decide.outputs.published != ''
+        run: |
+          skopeo inspect --no-creds --raw "docker://$PUBLISHED:$TAG" >/dev/null 2>&1 ||
+            echo "::warning::$PUBLISHED is private, hosts cannot pull it: make it public once at https://github.com/orgs/$GITHUB_REPOSITORY_OWNER/packages/container/package/${PUBLISHED##*/} (Package settings, Change visibility)" | tee -a "$GITHUB_STEP_SUMMARY"

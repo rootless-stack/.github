@@ -5,9 +5,11 @@
 #   ghcr.io/<owner>/<repo>/<image>:sha-<commit>-p<run>          the list
 #
 # The run ID makes every candidate unique, so concurrent runs never
-# overwrite each other's.  The calling stack validates the candidate,
-# then promote-image.yml copies the recorded digest to the published name,
-# signs it, or leaves the published tag alone when nothing changed.
+# overwrite each other's.  The calling stack's `validate` script checks
+# each architecture's image before it is pushed, so a candidate that fails
+# never reaches the registry; promote-image.yml then copies the recorded
+# digest to the published name, signs it, or leaves the published tag
+# alone when nothing changed.
 #
 # Trust: only runs on the default branch (push, schedule, dispatch) write
 # the layer cache; pull requests read it and never write it, so
@@ -26,7 +28,8 @@
 #   jobs:
 #     build:
 #       uses: rootless-stack/.github/.github/workflows/build-image.yml@main
-#       with: {image: postfix, context: dockerfiles, file: dockerfiles/postfix/Dockerfile}
+#       with: {image: postfix, context: dockerfiles, file: dockerfiles/postfix/Dockerfile,
+#              validate: tests/validate.sh}
 #       secrets:
 #         DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 #         DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -51,6 +54,12 @@ on:
         description: Build every layer fresh (nightly, so package updates land)
         type: boolean
         default: false
+      validate:
+        description: >-
+          Script in the calling repository, run as `<script> <image> <local ref>`
+          on each architecture's image before it is pushed; non-zero fails the build
+        type: string
+        default: ""
     secrets:
       # Optional: authenticated Docker Hub pulls for FROM docker.io/...;
       # without them buildah pulls anonymously, subject to Docker Hub's
@@ -154,6 +163,11 @@ jobs:
             "$img" "$content" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_SHA" > "$ctx/Containerfile"
           buildah build --pull=never --quiet -t "$img" "$ctx" >/dev/null
           rm -rf "$ctx"
+      - name: Validate
+        if: inputs.validate != ''
+        env:
+          VALIDATE: ${{ inputs.validate }}
+        run: '"./$VALIDATE" "$IMAGE" "localhost/local/$IMAGE:$ARCH"'
       - name: Push the candidate
         if: env.PUSH == 'true'
         run: |

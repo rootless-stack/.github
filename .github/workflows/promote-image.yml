@@ -122,7 +122,7 @@ jobs:
             done
           }
           if [ ! -f candidate/candidate.digest ]; then
-            echo "no candidate in this run — $PUBLISHED:$TAG unchanged" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "no candidate in this run — $PUBLISHED:$TAG not retagged" | tee -a "$GITHUB_STEP_SUMMARY"
             echo "action=none" >> "$GITHUB_OUTPUT"; exit 0
           fi
           digest=$(cat candidate/candidate.digest)
@@ -141,7 +141,7 @@ jobs:
           done
           if [ -n "$unchanged" ] && [ "$RESIGN" != true ] && signed "$PUBLISHED:$TAG"; then
             published=$(skopeo inspect --raw "docker://$PUBLISHED:$TAG" | sha256sum | cut -d' ' -f1)
-            echo "$candidate_ref has the content of $PUBLISHED:$TAG — unchanged, nothing restarts" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "$candidate_ref has the content of $PUBLISHED:$TAG — not retagged, not signed" | tee -a "$GITHUB_STEP_SUMMARY"
             { echo "action=none"; echo "published=sha256:$published"; } >> "$GITHUB_OUTPUT"
           else
             { echo "action=promote"; echo "candidate=$candidate_ref"; echo "published=sha256:$digest"; } >> "$GITHUB_OUTPUT"

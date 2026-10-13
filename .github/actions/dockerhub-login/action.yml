@@ -1,0 +1,33 @@
+# Docker Hub limits anonymous pulls per address, and GitHub's runners share
+# theirs: every job that pulls from docker.io logs in first, with the org's
+# read-only pull token (DOCKERHUB_USERNAME / DOCKERHUB_TOKEN).  Without
+# them, or in a fork's pull request, which gets no secrets, it pulls
+# anonymously and says so.  podman, buildah and skopeo share the login.
+#
+#   - uses: rootless-stack/.github/.github/actions/dockerhub-login@main
+#     with:
+#       username: ${{ secrets.DOCKERHUB_USERNAME }}
+#       token: ${{ secrets.DOCKERHUB_TOKEN }}
+name: Docker Hub login
+description: Log podman, buildah and skopeo in to Docker Hub, or warn and pull anonymously.
+inputs:
+  username:
+    description: Docker Hub user of the read-only pull token
+    default: ""
+  token:
+    description: The read-only pull token
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        USERNAME: ${{ inputs.username }}
+        TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        if [ -n "$USERNAME" ] && [ -n "$TOKEN" ]; then
+          printf '%s' "$TOKEN" | podman login --username "$USERNAME" --password-stdin docker.io
+        else
+          echo "::warning::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN unset: pulling from docker.io anonymously (rate-limited)"
+        fi
